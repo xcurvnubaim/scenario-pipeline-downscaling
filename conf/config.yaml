@@ -1,0 +1,77 @@
+# Base Hydra configuration for scenario-pipeline-downscaling
+#
+# Usage:
+#   python train.py                          # use defaults
+#   python train.py model=resnet             # swap to ResNet
+#   python train.py training.epochs=50      # override a single value
+#   python train.py +experiment=my_run      # enable an experiment override group
+#
+# All values can be overridden from the command line using Hydra's standard
+# override syntax (key=value).  Config groups (model, data) are loaded from
+# their respective sub-directories.
+
+defaults:
+  - model: unet                 # load conf/model/unet.yaml
+  - _self_                      # values in this file take lower precedence
+
+# ---------------------------------------------------------------------------
+# Data
+# ---------------------------------------------------------------------------
+data:
+  zarr_path: "data/climate.zarr"  # path to the Zarr store (relative to CWD)
+  input_var: "lr_field"           # name of the low-resolution input variable
+  target_var: "hr_field"          # name of the high-resolution target variable
+  time_dim: "time"
+  normalize: true
+  chunks:                         # Dask chunk sizes (null → {time: 1})
+    time: 8
+  batch_size: 16
+  num_workers: 4
+  val_split: 0.1                  # fraction of data used for validation
+  test_split: 0.1                 # fraction of data used for test
+
+# ---------------------------------------------------------------------------
+# Training
+# ---------------------------------------------------------------------------
+training:
+  epochs: 100
+  learning_rate: 1.0e-3
+  weight_decay: 1.0e-4
+  scheduler: "cosine"             # "cosine" | "step" | "none"
+  scheduler_kwargs:
+    T_max: 100                    # used by CosineAnnealingLR
+  loss: "mse"                     # "mse" | "mae" | "huber"
+  gradient_clip: 1.0              # max gradient norm (0 = disabled)
+  log_every_n_steps: 10
+  val_every_n_epochs: 5
+  checkpoint_dir: "checkpoints/"
+  seed: 42
+
+# ---------------------------------------------------------------------------
+# MLflow
+# ---------------------------------------------------------------------------
+mlflow:
+  tracking_uri: "mlruns/"        # local directory or remote URI
+  experiment_name: "downscaling"
+  run_name: null                  # null → auto-generated
+
+# ---------------------------------------------------------------------------
+# Visualization
+# ---------------------------------------------------------------------------
+visualization:
+  enabled: true
+  output_dir: "figures/"
+  dpi: 150
+  log_to_mlflow: true
+
+# ---------------------------------------------------------------------------
+# Hydra internals
+# ---------------------------------------------------------------------------
+hydra:
+  run:
+    dir: "outputs/${now:%Y-%m-%d}/${now:%H-%M-%S}"
+  sweep:
+    dir: "multirun/${now:%Y-%m-%d}/${now:%H-%M-%S}"
+    subdir: "${hydra.job.num}"
+  job:
+    chdir: true                   # change to the hydra output dir
