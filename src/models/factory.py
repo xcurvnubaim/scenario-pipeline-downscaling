@@ -19,6 +19,7 @@ from typing import Any
 
 import torch.nn as nn
 
+from .gan import RRDBGenerator
 from .resnet import ResNetDownscaler
 from .unet import UNet
 
@@ -28,6 +29,7 @@ from .unet import UNet
 _REGISTRY: dict[str, type] = {
     "unet": UNet,
     "resnet": ResNetDownscaler,
+    "rrdb": RRDBGenerator,
 }
 
 

@@ -19,123 +19,144 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 
-class _DoubleConv(nn.Module):
-    """Two consecutive Conv→BN→ReLU blocks."""
+# ==========================================
+# Building Blocks
+# ==========================================
 
-    def __init__(self, in_channels: int, out_channels: int) -> None:
+class _DoubleConv(nn.Module):
+    """Conv → BN → ReLU → Conv → BN → ReLU"""
+    def __init__(self, in_ch, out_ch):
         super().__init__()
-        self.block = nn.Sequential(
-            nn.Conv2d(in_channels, out_channels, kernel_size=3, padding=1, bias=False),
-            nn.BatchNorm2d(out_channels),
+        self.net = nn.Sequential(
+            nn.Conv2d(in_ch, out_ch, kernel_size=3, padding=1, bias=False),
+            nn.BatchNorm2d(out_ch),
             nn.ReLU(inplace=True),
-            nn.Conv2d(out_channels, out_channels, kernel_size=3, padding=1, bias=False),
-            nn.BatchNorm2d(out_channels),
+            nn.Conv2d(out_ch, out_ch, kernel_size=3, padding=1, bias=False),
+            nn.BatchNorm2d(out_ch),
             nn.ReLU(inplace=True),
         )
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.block(x)
+    def forward(self, x):
+        return self.net(x)
 
 
 class _Down(nn.Module):
-    """Max-pool then double-conv (encoder step)."""
-
-    def __init__(self, in_channels: int, out_channels: int) -> None:
+    """MaxPool → DoubleConv"""
+    def __init__(self, in_ch, out_ch):
         super().__init__()
-        self.block = nn.Sequential(
+        self.net = nn.Sequential(
             nn.MaxPool2d(2),
-            _DoubleConv(in_channels, out_channels),
+            _DoubleConv(in_ch, out_ch),
         )
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.block(x)
+    def forward(self, x):
+        return self.net(x)
 
 
 class _Up(nn.Module):
-    """Bilinear up-sample then concatenate skip-connection then double-conv."""
-
-    def __init__(self, in_channels: int, out_channels: int) -> None:
+    """Upsample → concat skip → DoubleConv"""
+    def __init__(self, in_ch, out_ch):
         super().__init__()
-        self.up = nn.Upsample(scale_factor=2, mode="bilinear", align_corners=True)
-        self.conv = _DoubleConv(in_channels, out_channels)
+        self.up   = nn.ConvTranspose2d(in_ch, in_ch // 2, kernel_size=2, stride=2)
+        self.conv = _DoubleConv(in_ch, out_ch)
 
-    def forward(self, x: torch.Tensor, skip: torch.Tensor) -> torch.Tensor:
+    def forward(self, x, skip):
         x = self.up(x)
-        # Handle odd spatial dimensions
-        diff_h = skip.size(2) - x.size(2)
-        diff_w = skip.size(3) - x.size(3)
-        x = F.pad(x, [diff_w // 2, diff_w - diff_w // 2, diff_h // 2, diff_h - diff_h // 2])
+        # Pad if spatial dims mismatch
+        dy = skip.shape[2] - x.shape[2]
+        dx = skip.shape[3] - x.shape[3]
+        x  = F.pad(x, [dx // 2, dx - dx // 2,
+                        dy // 2, dy - dy // 2])
         x = torch.cat([skip, x], dim=1)
         return self.conv(x)
 
 
-class UNet(nn.Module):
-    """U-Net for climate downscaling.
-
-    Parameters
-    ----------
-    in_channels:
-        Number of input channels (default 1 for a single climate variable).
-    out_channels:
-        Number of output channels (default 1).
-    features:
-        List of feature map sizes at each encoder level.
-    scale_factor:
-        Optional integer scale factor.  When > 1 the input is first
-        bi-linearly up-sampled to ``scale_factor × H`` before the U-Net
-        encoder runs.  Set to 1 (default) to skip the initial up-sampling.
+class UpscaleBlock(nn.Module):
     """
-
-    def __init__(
-        self,
-        in_channels: int = 1,
-        out_channels: int = 1,
-        features: List[int] = None,
-        scale_factor: int = 1,
-    ) -> None:
+    6× upscale via three 2× bilinear steps + refinement conv.
+    Input  : (B, C, 24, 32)   — low-res encoder output
+    Output : (B, C, 144, 192) — high-res prediction
+    """
+    def __init__(self, in_ch, out_ch):
         super().__init__()
-        if features is None:
-            features = [64, 128, 256, 512]
-
-        self.scale_factor = scale_factor
-
-        # Encoder
-        self.inc = _DoubleConv(in_channels, features[0])
-        self.down_blocks = nn.ModuleList(
-            [_Down(features[i], features[i + 1]) for i in range(len(features) - 1)]
+        self.up1   = nn.Sequential(
+            nn.Upsample(scale_factor=2, mode="bilinear", align_corners=False),
+            nn.Conv2d(in_ch,      in_ch // 2, kernel_size=3, padding=1, bias=False),
+            nn.BatchNorm2d(in_ch // 2),
+            nn.ReLU(inplace=True),
         )
-
-        # Bottleneck
-        self.bottleneck = _DoubleConv(features[-1], features[-1] * 2)
-
-        # Decoder (reverse order)
-        decoder_features = [features[-1] * 2] + list(reversed(features))
-        self.up_blocks = nn.ModuleList(
-            [
-                _Up(decoder_features[i] + decoder_features[i + 1], decoder_features[i + 1])
-                for i in range(len(decoder_features) - 1)
-            ]
+        self.up2   = nn.Sequential(
+            nn.Upsample(scale_factor=3, mode="bilinear", align_corners=False),
+            nn.Conv2d(in_ch // 2, in_ch // 4, kernel_size=3, padding=1, bias=False),
+            nn.BatchNorm2d(in_ch // 4),
+            nn.ReLU(inplace=True),
         )
+        self.refine = nn.Conv2d(in_ch // 4, out_ch, kernel_size=3, padding=1)
 
-        self.outc = nn.Conv2d(features[0], out_channels, kernel_size=1)
+    def forward(self, x):
+        x = self.up1(x)    # (B, C//2, 48,  64)
+        x = self.up2(x)    # (B, C//4, 144, 192)
+        return self.refine(x)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        if self.scale_factor > 1:
-            x = F.interpolate(x, scale_factor=self.scale_factor, mode="bilinear", align_corners=True)
 
+# ==========================================
+# U-Net + 6× Super-Resolution Head
+# ==========================================
+
+class UNet(nn.Module):
+    """
+    Input  : (B, 4, 24, 32)   — low-res forecast
+    Output : (B, 4, 144, 192) — high-res prediction
+    """
+    def __init__(self, in_ch=4, out_ch=4, base_ch=64):
+        super().__init__()
+
+        # ── Encoder ──────────────────────────────
+        self.enc1 = _DoubleConv(in_ch,       base_ch)      # (B, 64,  24, 32)
+        self.enc2 = _Down(base_ch,           base_ch * 2)  # (B, 128, 12, 16)
+        self.enc3 = _Down(base_ch * 2,       base_ch * 4)  # (B, 256,  6,  8)
+
+        # ── Bottleneck ───────────────────────────
+        self.bottleneck = _Down(base_ch * 4, base_ch * 8)  # (B, 512,  3,  4)
+
+        # ── Decoder ──────────────────────────────
+        self.dec3 = _Up(base_ch * 8,  base_ch * 4)         # (B, 256,  6,  8)
+        self.dec2 = _Up(base_ch * 4,  base_ch * 2)         # (B, 128, 12, 16)
+        self.dec1 = _Up(base_ch * 2,  base_ch)             # (B, 64,  24, 32)
+
+        # ── 6× Super-Resolution Head ─────────────
+        self.sr_head = UpscaleBlock(base_ch, out_ch)      # (B, 4, 144, 192)
+
+    def forward(self, x):
         # Encoder
-        skips: List[torch.Tensor] = []
-        x = self.inc(x)
-        skips.append(x)
-        for down in self.down_blocks:
-            x = down(x)
-            skips.append(x)
-
-        # Bottleneck
-        x = self.bottleneck(x)
+        s1 = self.enc1(x)        # skip 1
+        s2 = self.enc2(s1)       # skip 2
+        s3 = self.enc3(s2)       # skip 3
+        bn = self.bottleneck(s3)
 
         # Decoder
-        for up, skip in zip(self.up_blocks, reversed(skips)):
-            x = up(x, skip)
+        x = self.dec3(bn, s3)
+        x = self.dec2(x,  s2)
+        x = self.dec1(x,  s1)
 
-        return self.outc(x)
+        # 6× upscale to high-res
+        return self.sr_head(x)
+
+
+class SRUNet(UNet):
+    """Compatibility wrapper for configs using SRUNet naming."""
+
+    def __init__(self, in_channels: int = 4, out_channels: int = 4, base_channels: int = 64):
+        super().__init__(in_ch=in_channels, out_ch=out_channels, base_ch=base_channels)
+
+if __name__ == "__main__":
+    model  = UNet(in_ch=4, out_ch=4, base_ch=64)
+    dummy  = torch.randn(2, 4, 24, 32)   # batch=2, 4 vars, 24×32 low-res
+    output = model(dummy)
+
+    print("Input  :", dummy.shape)   # (2, 4,  24,  32)
+    print("Output :", output.shape)  # (2, 4, 144, 192)
+
+    total_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    print(f"Params : {total_params:,}")
+    
